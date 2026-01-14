@@ -35,6 +35,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     is_torch_xla_available,
     logging,
+    global_context
 )
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -175,6 +176,13 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
         )
         self.image_processor = OmniGen2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_resize=True)
         self.default_sample_size = 128
+
+        global_context.update(
+            model_name="omnigen2",
+            num_layers=self.transformer.config.num_layers,
+            hidden_dim=self.transformer.config.hidden_size,
+            encoder_hidden_dim=None, # for omnigen, all tokens use the hidden dim
+        )
 
     def prepare_latents(
         self,
@@ -575,6 +583,13 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
             latents,
         )
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            hidden_seq_height=(height // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_width=(width // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_len=(height // (self.vae_scale_factor) // self.transformer.config.patch_size) * (width // (self.vae_scale_factor) // self.transformer.config.patch_size),
+        )
+
         freqs_cis = OmniGen2RotaryPosEmbed.get_freqs_cis(
             self.transformer.config.axes_dim_rope,
             self.transformer.config.axes_lens,
@@ -651,6 +666,10 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                global_context.update(
+                    current_timestep=t, current_iteration=i
+                )
+
                 if enable_taylorseer:
                     self.transformer.cache_dic = model_pred_cache_dic
                     self.transformer.current = model_pred_current
@@ -658,6 +677,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                     teacache_params.is_first_or_last_step = i == 0 or i == len(timesteps) - 1
                     self.transformer.teacache_params = teacache_params
 
+                global_context.update(cfg_mode=0)
                 model_pred = self.predict(
                     t=t,
                     latents=latents,
@@ -677,6 +697,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         teacache_params_ref.is_first_or_last_step = i == 0 or i == len(timesteps) - 1
                         self.transformer.teacache_params = teacache_params_ref
 
+                    global_context.update(cfg_mode=1)
                     model_pred_ref = self.predict(
                         t=t,
                         latents=latents,
@@ -693,6 +714,7 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         teacache_params_uncond.is_first_or_last_step = i == 0 or i == len(timesteps) - 1
                         self.transformer.teacache_params = teacache_params_uncond
 
+                    global_context.update(cfg_mode=2)
                     model_pred_uncond = self.predict(
                         t=t,
                         latents=latents,
@@ -704,6 +726,11 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
 
                     model_pred = model_pred_uncond + image_guidance_scale * (model_pred_ref - model_pred_uncond) + \
                         text_guidance_scale * (model_pred - model_pred_ref)
+                    
+                    global_context.update(
+                        last_cfg_hidden_state=(model_pred_ref - model_pred_uncond).abs() + (model_pred - model_pred_ref).abs()
+                    )
+
                 elif text_guidance_scale > 1.0:
                     if enable_taylorseer:
                         self.transformer.cache_dic = model_pred_uncond_cache_dic
@@ -721,6 +748,10 @@ class OmniGen2Pipeline(DiffusionPipeline, OmniGen2LoraLoaderMixin):
                         ref_image_hidden_states=None,
                     )
                     model_pred = model_pred_uncond + text_guidance_scale * (model_pred - model_pred_uncond)
+
+                    global_context.update(
+                        last_cfg_hidden_state=(model_pred - model_pred_uncond).abs()
+                    )
 
                 latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
 

@@ -268,6 +268,12 @@ class OmniGen2AttnProcessor:
                 "OmniGen2AttnProcessorFlash2Varlen requires PyTorch 2.0. "
                 "Please upgrade PyTorch to version 2.0 or later."
             )
+        
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,

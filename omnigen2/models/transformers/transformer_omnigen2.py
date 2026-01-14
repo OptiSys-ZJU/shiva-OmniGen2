@@ -12,7 +12,7 @@ from einops import rearrange
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
 from diffusers.loaders.single_file_model import FromOriginalModelMixin
-from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
+from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers, delegated_forward, global_context
 from diffusers.models.attention_processor import Attention
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
@@ -114,6 +114,14 @@ class OmniGen2TransformerBlock(nn.Module):
 
         self.initialize_weights()
 
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
+        self.attn.processor.register_hook('self-attn', hook)
+        hook.on_register_hook(self)
+
     def initialize_weights(self) -> None:
         """
         Initialize the weights of the transformer block.
@@ -133,6 +141,7 @@ class OmniGen2TransformerBlock(nn.Module):
             nn.init.zeros_(self.norm1.linear.weight)
             nn.init.zeros_(self.norm1.linear.bias)
 
+    @delegated_forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -587,6 +596,8 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         temb, text_hidden_states = self.time_caption_embed(timestep, text_hidden_states, hidden_states[0].dtype)
 
+        global_context.update(pure_temb=temb)
+
         (
             hidden_states,
             ref_image_hidden_states,
@@ -642,6 +653,15 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, :seq_len - encoder_seq_len]
 
         hidden_states = joint_hidden_states
+
+        if global_context.cfg_mode == 0:
+            global_context.update(encoder_hidden_seq_len=seq_lengths[0]-global_context.hidden_seq_len)
+        elif global_context.cfg_mode == 1:
+            global_context.update(cfg_encoder_hidden_seq_len_placeholder_1=seq_lengths[0]-global_context.hidden_seq_len)
+        elif global_context.cfg_mode == 2:
+            global_context.update(cfg_encoder_hidden_seq_len_placeholder_2=seq_lengths[0]-global_context.hidden_seq_len)
+        else:
+            raise ValueError(f"cfg_mode {global_context.cfg_mode} is not set.")
 
         if self.enable_teacache:
             teacache_hidden_states = hidden_states.clone()
